@@ -5,7 +5,7 @@ import { ChevronDown, Wrench, FileText, Search, BookOpen, AlertTriangle } from "
 import type { ChatTraceEvent } from "@/api/types";
 
 const props = defineProps<{ trace: ChatTraceEvent[]; streaming: boolean }>();
-const open = ref(true);
+const open = ref(false);
 
 interface ToolStep {
   name: string;

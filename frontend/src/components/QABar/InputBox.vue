@@ -53,7 +53,7 @@ function onKeydown(e: KeyboardEvent) {
 </script>
 
 <template>
-  <div class="flex items-end gap-2.5">
+  <div class="flex items-start gap-2.5">
     <div class="flex-1 relative">
       <textarea
         ref="textareaRef"

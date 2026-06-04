@@ -43,6 +43,34 @@ export interface ChatTraceEvent {
   at: number; // epoch ms
 }
 
+export interface ChatSession {
+  id: string;
+  title: string | null;
+  scope_mode: ScopeMode;
+  scope_id: string | null;
+  created_at: string;
+  msg_count: number;
+  last_at: string | null;
+}
+
+export interface StoredMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  trace_json: string | null;
+  created_at: string;
+}
+
+export interface SessionDetail {
+  session: {
+    id: string;
+    title: string | null;
+    scope_mode: ScopeMode;
+    scope_id: string | null;
+  };
+  messages: StoredMessage[];
+}
+
 export interface SettingsView {
   llm_provider: "mimo" | "lmstudio";
   mimo_model: string;

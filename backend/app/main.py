@@ -31,7 +31,7 @@ app.add_middleware(
 )
 
 # Routers — imported here to keep startup cheap and avoid circular imports.
-from app.api import health, folders, docs, upload, chat
+from app.api import health, folders, docs, upload, chat, sessions
 from app.api import settings as settings_api
 
 app.include_router(health.router, prefix="/api")
@@ -39,4 +39,5 @@ app.include_router(folders.router, prefix="/api")
 app.include_router(docs.router, prefix="/api")
 app.include_router(upload.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
+app.include_router(sessions.router, prefix="/api")
 app.include_router(settings_api.router, prefix="/api")

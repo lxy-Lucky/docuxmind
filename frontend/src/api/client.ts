@@ -1,4 +1,12 @@
-import type { Doc, Folder, FolderColor, SettingsView } from "./types";
+import type {
+  ChatSession,
+  Doc,
+  Folder,
+  FolderColor,
+  ScopeMode,
+  SessionDetail,
+  SettingsView,
+} from "./types";
 
 const BASE = "/api";
 
@@ -57,6 +65,24 @@ export async function uploadFile(folderId: string, file: File): Promise<Doc> {
   }
   return res.json();
 }
+
+// Sessions
+export const sessionApi = {
+  list: () => request<ChatSession[]>("/sessions"),
+  detail: (id: string) => request<SessionDetail>(`/sessions/${id}/messages`),
+  create: (scope_mode: ScopeMode, scope_id: string | null, title?: string) =>
+    request<{ id: string; title: string | null }>("/sessions", {
+      method: "POST",
+      body: JSON.stringify({ scope_mode, scope_id, title }),
+    }),
+  rename: (id: string, title: string) =>
+    request<{ ok: true }>(`/sessions/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title }),
+    }),
+  remove: (id: string) =>
+    request<{ ok: true }>(`/sessions/${id}`, { method: "DELETE" }),
+};
 
 // Settings
 export const settingsApi = {

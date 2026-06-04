@@ -5,7 +5,7 @@
   event: tool_call     { name, args }
   event: tool_result   { name, result }   # truncated
   event: token         { text }           # intermediate model prose (rare)
-  event: answer        { content }        # final answer
+  event: answer        { content, report_file? }
   event: done          { trace_id, total_tokens, steps }
   event: error         { reason, message? }
 """
@@ -54,9 +54,72 @@ def _sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _persist_user(req: ChatRequest) -> None:
+    """Save the user's question immediately so refresh/cancel doesn't lose it."""
+    if not req.session_id:
+        return
+    try:
+        with db() as c:
+            # auto-title from first question (≤40 chars), only set if title is NULL
+            c.execute(
+                "INSERT OR IGNORE INTO chat_sessions(id, title, scope_mode, scope_id) VALUES (?, ?, ?, ?)",
+                (req.session_id, req.question[:40], req.scope_mode, req.scope_id),
+            )
+            c.execute(
+                "UPDATE chat_sessions SET title = COALESCE(title, ?) WHERE id = ?",
+                (req.question[:40], req.session_id),
+            )
+            c.execute(
+                "INSERT INTO chat_messages(id, session_id, role, content) VALUES (?, ?, ?, ?)",
+                (uuid.uuid4().hex[:12], req.session_id, "user", req.question),
+            )
+    except Exception as e:
+        log.warning("persist_user.failed", error=str(e))
+
+
+def _persist_assistant(
+    req: ChatRequest,
+    content: str,
+    trace_id: str,
+    steps: int,
+    tokens: int,
+    status: str,
+    report_file: str | None = None,
+) -> None:
+    try:
+        with db() as c:
+            c.execute(
+                "INSERT INTO agent_runs(id, session_id, trace_id, status, steps, total_tokens, finished_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+                (uuid.uuid4().hex[:12], req.session_id, trace_id, status, steps, tokens),
+            )
+            if req.session_id:
+                c.execute(
+                    "INSERT INTO chat_messages(id, session_id, role, content, trace_json) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        uuid.uuid4().hex[:12],
+                        req.session_id,
+                        "assistant",
+                        content,
+                        json.dumps(
+                            {
+                                "trace_id": trace_id,
+                                "status": status,
+                                "report_file": report_file,
+                            }
+                        ),
+                    ),
+                )
+    except Exception as e:
+        log.warning("persist_assistant.failed", error=str(e))
+
+
 async def run_agent(req: ChatRequest) -> AsyncIterator[str]:
     trace_id = uuid.uuid4().hex[:12]
     log.info("agent.start", trace_id=trace_id, scope=req.scope_mode)
+
+    # Save the user's question now — survives refresh / cancel / crash.
+    _persist_user(req)
 
     prefix = scope_prefix(req.scope_mode, req.scope_id, req.scope_name)
     messages: list[dict[str, Any]] = [
@@ -81,12 +144,12 @@ async def run_agent(req: ChatRequest) -> AsyncIterator[str]:
             )
         except asyncio.TimeoutError:
             yield _sse("error", {"reason": "llm_timeout", "step": step})
-            _persist(req, "(LLM timeout)", trace_id, steps_used, total_tokens, "error")
+            _persist_assistant(req, "(LLM timeout)", trace_id, steps_used, total_tokens, "error")
             return
         except Exception as e:
             log.error("agent.llm_error", trace_id=trace_id, error=str(e))
             yield _sse("error", {"reason": "llm_error", "message": str(e), "step": step})
-            _persist(req, f"(LLM error: {e})", trace_id, steps_used, total_tokens, "error")
+            _persist_assistant(req, f"(LLM error: {e})", trace_id, steps_used, total_tokens, "error")
             return
 
         msg = resp.choices[0].message
@@ -95,7 +158,7 @@ async def run_agent(req: ChatRequest) -> AsyncIterator[str]:
             total_tokens += getattr(usage, "total_tokens", 0) or 0
             if total_tokens > settings.agent_total_token_limit:
                 yield _sse("error", {"reason": "token_limit", "tokens": total_tokens})
-                _persist(req, "(token limit)", trace_id, steps_used, total_tokens, "error")
+                _persist_assistant(req, "(token limit)", trace_id, steps_used, total_tokens, "error")
                 return
 
         tool_calls = msg.tool_calls or []
@@ -109,7 +172,7 @@ async def run_agent(req: ChatRequest) -> AsyncIterator[str]:
                     "done",
                     {"trace_id": trace_id, "total_tokens": total_tokens, "steps": steps_used},
                 )
-                _persist(req, final, trace_id, steps_used, total_tokens, "done")
+                _persist_assistant(req, final, trace_id, steps_used, total_tokens, "done")
                 return
             # Model gave plain prose without [DONE] — nudge it.
             messages.append({"role": "assistant", "content": content})
@@ -142,53 +205,20 @@ async def run_agent(req: ChatRequest) -> AsyncIterator[str]:
             )
 
             if fn_name == "write_report" and not result.startswith("Error"):
-                final_msg = f"报告已生成：{result}"
-                yield _sse("answer", {"content": final_msg})
+                # The report content is the markdown the LLM just wrote — use it
+                # as the visible answer instead of the "Report saved: ..." line.
+                report_md = (fn_args.get("content") or "").strip()
+                report_file = fn_args.get("filename") or ""
+                final = report_md or f"报告已保存：{result}"
+                yield _sse("answer", {"content": final, "report_file": report_file})
                 yield _sse(
                     "done",
                     {"trace_id": trace_id, "total_tokens": total_tokens, "steps": steps_used},
                 )
-                _persist(req, final_msg, trace_id, steps_used, total_tokens, "done")
+                _persist_assistant(
+                    req, final, trace_id, steps_used, total_tokens, "done", report_file
+                )
                 return
 
     yield _sse("error", {"reason": "max_steps_reached"})
-    _persist(req, "(max steps reached)", trace_id, steps_used, total_tokens, "error")
-
-
-def _persist(
-    req: ChatRequest,
-    content: str,
-    trace_id: str,
-    steps: int,
-    tokens: int,
-    status: str,
-) -> None:
-    """Best-effort persistence; never raise out of agent loop."""
-    try:
-        with db() as c:
-            c.execute(
-                "INSERT INTO agent_runs(id, session_id, trace_id, status, steps, total_tokens, finished_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
-                (uuid.uuid4().hex[:12], req.session_id, trace_id, status, steps, tokens),
-            )
-            if req.session_id:
-                c.execute(
-                    "INSERT OR IGNORE INTO chat_sessions(id, scope_mode, scope_id) VALUES (?, ?, ?)",
-                    (req.session_id, req.scope_mode, req.scope_id),
-                )
-                c.execute(
-                    "INSERT INTO chat_messages(id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                    (uuid.uuid4().hex[:12], req.session_id, "user", req.question),
-                )
-                c.execute(
-                    "INSERT INTO chat_messages(id, session_id, role, content, trace_json) VALUES (?, ?, ?, ?, ?)",
-                    (
-                        uuid.uuid4().hex[:12],
-                        req.session_id,
-                        "assistant",
-                        content,
-                        json.dumps({"trace_id": trace_id, "status": status}),
-                    ),
-                )
-    except Exception as e:
-        log.warning("persist.failed", error=str(e))
+    _persist_assistant(req, "(max steps reached)", trace_id, steps_used, total_tokens, "error")

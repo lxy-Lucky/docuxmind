@@ -78,6 +78,15 @@ async function copy() {
       />
 
       <div
+        v-if="msg.status === 'done' && msg.report_file"
+        class="mt-4 inline-flex items-center gap-1.5 text-[10px] font-mono text-text-3 bg-bg-surface border border-line px-2.5 py-1 rounded-full"
+        :title="`已保存到 data/reports/${msg.report_file}`"
+      >
+        <FileText :size="11" />
+        已存档 · {{ msg.report_file }}
+      </div>
+
+      <div
         v-if="msg.status === 'error'"
         class="mt-3 text-[12px] font-mono text-bad bg-[var(--red-dim)] border border-bad/30 rounded-sm px-3 py-2"
       >
