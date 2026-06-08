@@ -9,7 +9,7 @@ from typing import Any
 from app.core.config import settings
 from app.db.session import db
 
-MAX_RESULT_CHARS = 3500
+MAX_RESULT_CHARS = 2500
 
 
 def _truncate(t: str, limit: int = MAX_RESULT_CHARS) -> str:
