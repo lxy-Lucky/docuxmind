@@ -10,7 +10,6 @@ from app.core.config import settings
 from app.db.session import db
 
 MAX_RESULT_CHARS = 3500
-SNIPPET_WINDOW = 40  # chars of context shown around a LIKE-matched substring
 
 
 def _truncate(t: str, limit: int = MAX_RESULT_CHARS) -> str:
@@ -22,33 +21,6 @@ def _truncate(t: str, limit: int = MAX_RESULT_CHARS) -> str:
 def _fts_quote(s: str) -> str:
     """Wrap user keyword as a phrase to avoid FTS5 syntax surprises."""
     return '"' + s.replace('"', '""') + '"'
-
-
-def _like_escape(s: str) -> str:
-    """Escape LIKE wildcards so the keyword is matched literally (ESCAPE '\\')."""
-    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-def _manual_snip(content: str, keyword: str) -> str | None:
-    """Build a small <<>>-marked snippet around the first match of keyword.
-
-    Returns None if the keyword is not present in the content (e.g. it only
-    matched the locator / sheet title).
-    """
-    if not content:
-        return None
-    low = content.lower()
-    k = keyword.lower()
-    i = low.find(k)
-    if i < 0:
-        return None
-    s = max(0, i - SNIPPET_WINDOW)
-    e = min(len(content), i + len(keyword) + SNIPPET_WINDOW)
-    body = (
-        content[s:i] + "<<" + content[i : i + len(keyword)] + ">>" + content[i + len(keyword) : e]
-    )
-    body = body.replace("\n", " ").strip()
-    return ("..." if s > 0 else "") + body + ("..." if e < len(content) else "")
 
 
 # ── Navigation ────────────────────────────────────────────────
@@ -114,6 +86,8 @@ def read_section(doc_id: str, locator: str) -> str:
        - 'L100-L180'
        - 'heading=Authentication'
        Partial substring matches are accepted; full locator list is returned on miss.
+       Fallback: if locator looks like 'L<start>-L<end>' and no segment matches,
+       extract the requested line range directly from overlapping segments.
     """
     with db() as c:
         rows = c.execute(
@@ -130,93 +104,91 @@ def read_section(doc_id: str, locator: str) -> str:
 
     needle = locator.lower()
     matched = [r for r in rows if needle in r["locator"].lower()]
-    if not matched:
-        avail = "\n".join(r["locator"] for r in rows[:20])
-        return f"Error: no segment matches '{locator}'. Available locators:\n{avail}"
-    joined = "\n---\n".join(f"[{r['locator']}]\n{r['content']}" for r in matched[:3])
-    return _truncate(joined)
+    if matched:
+        joined = "\n---\n".join(f"[{r['locator']}]\n{r['content']}" for r in matched[:3])
+        return _truncate(joined)
+
+    # ── Fallback: parse L<start>-L<end> and slice from overlapping segments ──
+    result = _try_line_range_extract(locator, rows)
+    if result:
+        return _truncate(result)
+
+    avail = "\n".join(r["locator"] for r in rows[:20])
+    return f"Error: no segment matches '{locator}'. Available locators:\n{avail}"
 
 
-# ── Searching (FTS5 BM25, with LIKE fallback for titles / CJK substrings) ─────
+_LINE_RANGE_RE = __import__("re").compile(r"L(\d+)\s*-\s*L(\d+)", __import__("re").IGNORECASE)
+
+
+def _parse_seg_lines(loc: str) -> tuple[int, int] | None:
+    """Extract (start, end) 1-based line numbers from a locator string."""
+    m = _LINE_RANGE_RE.search(loc)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _try_line_range_extract(locator: str, rows: list) -> str | None:
+    """If locator is 'L18-L31', reconstruct text from overlapping segments."""
+    req = _parse_seg_lines(locator)
+    if not req:
+        return None
+    req_start, req_end = req
+
+    # Collect all segments that have a parseable line range
+    candidates: list[tuple[int, int, str]] = []
+    for r in rows:
+        seg = _parse_seg_lines(r["locator"])
+        if seg:
+            candidates.append((seg[0], seg[1], r["content"]))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+
+    # Find overlapping segments and extract the requested lines
+    collected_lines: list[str] = []
+    for seg_start, seg_end, content in candidates:
+        # No overlap → skip
+        if seg_end < req_start or seg_start > req_end:
+            continue
+        seg_lines = content.splitlines()
+        # Calculate which lines within this segment to take
+        take_from = max(req_start, seg_start) - seg_start  # 0-based offset into seg_lines
+        take_to = min(req_end, seg_end) - seg_start + 1
+        collected_lines.extend(seg_lines[take_from:take_to])
+
+    if not collected_lines:
+        return None
+    return "\n".join(collected_lines)
+
+
+# ── Searching (FTS5, BM25 ranked) ─────────────────────────────
 
 def _fts_query(filter_sql: str | None, args: tuple, keyword: str) -> str:
-    """Keyword search combining two passes, de-duplicated by (doc_id, locator):
-
-      1. FTS5 MATCH over content — ranked (BM25), primary results.
-      2. LIKE fallback over locator + content — catches sheet/section *titles*
-         (which live in the locator, not the content) and CJK substrings that
-         the FTS tokenizer can't segment (e.g. '显存' inside '剩余显存空间').
-
-    The LIKE pass is a table scan; fine for a local KB. FTS hits are listed
-    first so ranking is preserved; LIKE-only hits are appended.
-    """
     if not keyword.strip():
         return "Error: empty keyword"
-    keyword = keyword.strip()
-
-    seen: set[tuple[str, str]] = set()
-    hits: list[tuple[str, str, str]] = []  # (doc_id, locator, snippet)
-    fts_err: str | None = None
-
+    where = ["fts_segments MATCH ?"]
+    params: list[Any] = [_fts_quote(keyword)]
+    if filter_sql:
+        where.append(filter_sql)
+        params.extend(args)
+    sql = (
+        "SELECT doc_id, folder_id, locator, "
+        "snippet(fts_segments, 3, '<<', '>>', '...', 18) AS snip "
+        "FROM fts_segments WHERE "
+        + " AND ".join(where)
+        + " ORDER BY rank LIMIT 20"
+    )
     with db() as c:
-        # ── pass 1: FTS5 MATCH (ranked) ──
-        where = ["fts_segments MATCH ?"]
-        params: list[Any] = [_fts_quote(keyword)]
-        if filter_sql:
-            where.append(filter_sql)
-            params.extend(args)
-        sql = (
-            "SELECT doc_id, locator, "
-            "snippet(fts_segments, 3, '<<', '>>', '...', 18) AS snip "
-            "FROM fts_segments WHERE "
-            + " AND ".join(where)
-            + " ORDER BY rank LIMIT 20"
-        )
         try:
-            for r in c.execute(sql, params).fetchall():
-                key = (r["doc_id"], r["locator"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                hits.append((r["doc_id"], r["locator"], r["snip"]))
+            rows = c.execute(sql, params).fetchall()
         except Exception as e:
-            fts_err = str(e)  # don't bail — LIKE pass may still find it
-
-        # ── pass 2: LIKE fallback (locator + content) ──
-        if len(hits) < 20:
-            pat = f"%{_like_escape(keyword)}%"
-            lwhere = ["(locator LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')"]
-            lparams: list[Any] = [pat, pat]
-            if filter_sql:
-                lwhere.append(filter_sql)
-                lparams.extend(args)
-            lsql = (
-                "SELECT doc_id, locator, content FROM fts_segments WHERE "
-                + " AND ".join(lwhere)
-                + " LIMIT 40"
-            )
-            try:
-                for r in c.execute(lsql, lparams).fetchall():
-                    key = (r["doc_id"], r["locator"])
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    snip = _manual_snip(r["content"] or "", keyword)
-                    if snip is None:
-                        # matched the locator only → it's a sheet/section title
-                        snip = "(命中表名/章节标题)"
-                    hits.append((r["doc_id"], r["locator"], snip))
-                    if len(hits) >= 20:
-                        break
-            except Exception:
-                pass  # LIKE fallback is best-effort
-
-        if not hits:
-            if fts_err:
-                return f"Error: FTS query failed: {fts_err}"
+            return f"Error: FTS query failed: {e}"
+        if not rows:
             return f"(no hits for '{keyword}')"
-
-        ids = list({d for d, _, _ in hits})
+        ids = list({r["doc_id"] for r in rows})
         placeholders = ",".join("?" * len(ids))
         name_map = {
             r["id"]: r["name"]
@@ -224,8 +196,10 @@ def _fts_query(filter_sql: str | None, args: tuple, keyword: str) -> str:
                 f"SELECT id, name FROM docs WHERE id IN ({placeholders})", ids
             ).fetchall()
         }
-
-    lines = [f"[{name_map.get(d, d)}] [{loc}] {snip}" for d, loc, snip in hits[:20]]
+    lines = [
+        f"[{name_map.get(r['doc_id'], r['doc_id'])}] [{r['locator']}] {r['snip']}"
+        for r in rows
+    ]
     return _truncate("\n".join(lines))
 
 
@@ -307,7 +281,7 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "read_section",
-            "description": "按定位读取文档段落。locator 示例：'sheet=Sheet1|rows=1-40' 或 'L100-L180' 或 'heading=认证'",
+            "description": "按定位读取文档段落。locator 必须来自 get_doc_outline 或 search 返回的真实 locator，禁止自行构造行号。示例：'sheet=Sheet1|rows=1-40' / 'L1-L17 | import React...' / 'heading=认证'",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -322,7 +296,7 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "search_in_doc",
-            "description": "在单个文档中关键词检索（FTS5 BM25 排序；同时匹配表名/章节标题与正文）",
+            "description": "在单个文档中关键词检索（FTS5 BM25 排序）",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -337,7 +311,7 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "search_in_folder",
-            "description": "在指定文件夹中跨文档关键词检索（同时匹配表名/章节标题与正文）",
+            "description": "在指定文件夹中跨文档关键词检索",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -352,7 +326,7 @@ TOOLS_SPEC = [
         "type": "function",
         "function": {
             "name": "search_all",
-            "description": "在所有文档中跨文件关键词检索（同时匹配表名/章节标题与正文）",
+            "description": "在所有文档中跨文件关键词检索",
             "parameters": {
                 "type": "object",
                 "properties": {"keyword": {"type": "string"}},

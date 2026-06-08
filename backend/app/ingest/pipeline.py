@@ -4,6 +4,7 @@ import traceback
 
 from app.core.logging import get_logger
 from app.db.session import db
+from app.ingest.parsers import code as code_parser
 from app.ingest.parsers import md as md_parser
 from app.ingest.parsers import txt as txt_parser
 from app.ingest.parsers import xlsx as xlsx_parser
@@ -14,6 +15,7 @@ PARSERS = {
     "txt": txt_parser.parse,
     "md": md_parser.parse,
     "xlsx": xlsx_parser.parse,
+    "code": code_parser.parse,
     # pdf/docx/csv come in Sprint 3
 }
 

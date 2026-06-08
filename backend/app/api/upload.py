@@ -10,7 +10,8 @@ from app.ingest.pipeline import run_ingest
 
 router = APIRouter(tags=["upload"])
 
-ALLOWED_EXT = {"pdf", "docx", "doc", "md", "txt", "csv", "xlsx", "xls", "xlsm", "json"}
+ALLOWED_EXT = {"pdf", "docx", "doc", "md", "txt", "csv", "xlsx", "xls", "xlsm", "json",
+               "js", "jsx", "ts", "tsx", "mjs", "cjs", "java"}
 TYPE_MAP = {
     "pdf": "pdf",
     "docx": "docx",
@@ -22,6 +23,13 @@ TYPE_MAP = {
     "xls": "xlsx",
     "xlsm": "xlsx",
     "json": "txt",
+    "js": "code",
+    "jsx": "code",
+    "ts": "code",
+    "tsx": "code",
+    "mjs": "code",
+    "cjs": "code",
+    "java": "code",
 }
 
 
